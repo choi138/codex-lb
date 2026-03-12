@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import contextvars
 import ipaddress
 import json
+import logging
 import socket
+import time
 from dataclasses import dataclass
 from typing import AsyncContextManager, AsyncIterator, Awaitable, Mapping, Protocol, TypeAlias, cast
 from urllib.parse import ParseResult, urlparse, urlunparse
@@ -49,6 +53,54 @@ _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
 _IMAGE_INLINE_TIMEOUT_SECONDS = 8.0
 _BLOCKED_LITERAL_HOSTS = {"localhost", "localhost.localdomain"}
+_UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
+    {
+        "accept",
+        "chatgpt-account-id",
+        "content-type",
+        "request-id",
+        "session_id",
+        "user-agent",
+        "x-codex-conversation-id",
+        "x-codex-session-id",
+        "x-openai-client-arch",
+        "x-openai-client-id",
+        "x-openai-client-os",
+        "x-openai-client-user-agent",
+        "x-openai-client-version",
+        "x-request-id",
+    }
+)
+
+logger = logging.getLogger(__name__)
+_STREAM_CONNECT_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "stream_connect_timeout_override",
+    default=None,
+)
+_STREAM_IDLE_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "stream_idle_timeout_override",
+    default=None,
+)
+_STREAM_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "stream_total_timeout_override",
+    default=None,
+)
+_COMPACT_CONNECT_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "compact_connect_timeout_override",
+    default=None,
+)
+_COMPACT_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "compact_total_timeout_override",
+    default=None,
+)
+_TRANSCRIBE_CONNECT_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "transcribe_connect_timeout_override",
+    default=None,
+)
+_TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "transcribe_total_timeout_override",
+    default=None,
+)
 
 
 class StreamIdleTimeoutError(Exception):
@@ -136,6 +188,150 @@ def _build_upstream_headers(
     return headers
 
 
+def _interesting_upstream_header_keys(headers: Mapping[str, str]) -> list[str]:
+    return sorted({key.lower() for key in headers if key.lower() in _UPSTREAM_TRACE_HEADER_ALLOWLIST})
+
+
+def _summarize_upstream_target(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _summarize_input_value(value: JsonValue | None) -> str:
+    if value is None:
+        return "0"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        if not value:
+            return "0"
+        type_counts: dict[str, int] = {}
+        for item in value:
+            type_name = type(item).__name__
+            type_counts[type_name] = type_counts.get(type_name, 0) + 1
+        summary = ",".join(f"{key}={type_counts[key]}" for key in sorted(type_counts))
+        return f"{len(value)}({summary})"
+    return type(value).__name__
+
+
+def _summarize_json_payload(payload: Mapping[str, JsonValue]) -> str:
+    keys = sorted(payload.keys())
+    model = payload.get("model")
+    stream = payload.get("stream")
+    input_summary = _summarize_input_value(payload.get("input"))
+    return f"model={model} stream={stream} input={input_summary} keys={keys}"
+
+
+def _summarize_transcription_payload(
+    *,
+    filename: str,
+    content_type: str | None,
+    prompt: str | None,
+    audio_bytes: bytes,
+) -> dict[str, JsonValue]:
+    return {
+        "filename": filename,
+        "content_type": content_type,
+        "prompt_present": prompt is not None,
+        "audio_bytes": len(audio_bytes),
+    }
+
+
+def _error_details_from_envelope(payload: OpenAIErrorEnvelope) -> tuple[str | None, str | None]:
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    code = error.get("code")
+    message = error.get("message")
+    return code if isinstance(code, str) else None, message if isinstance(message, str) else None
+
+
+def _error_details_from_failed_event(payload: ResponseFailedEvent) -> tuple[str | None, str | None]:
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return None, None
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    code = error.get("code")
+    message = error.get("message")
+    return code if isinstance(code, str) else None, message if isinstance(message, str) else None
+
+
+def _maybe_log_upstream_request_start(
+    *,
+    kind: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload_summary: str,
+    payload_json: str | None = None,
+) -> None:
+    settings = get_settings()
+    if not settings.log_upstream_request_summary and not settings.log_upstream_request_payload:
+        return
+
+    request_id = get_request_id()
+    target = _summarize_upstream_target(url)
+    account_id = headers.get("chatgpt-account-id")
+    header_keys = _interesting_upstream_header_keys(headers)
+
+    if settings.log_upstream_request_summary:
+        logger.info(
+            "upstream_request_start request_id=%s kind=%s method=POST target=%s account_id=%s headers=%s payload=%s",
+            request_id,
+            kind,
+            target,
+            account_id,
+            header_keys,
+            payload_summary,
+        )
+    if settings.log_upstream_request_payload and payload_json is not None:
+        logger.info(
+            "upstream_request_payload request_id=%s kind=%s target=%s payload=%s",
+            request_id,
+            kind,
+            target,
+            payload_json,
+        )
+
+
+def _maybe_log_upstream_request_complete(
+    *,
+    kind: str,
+    url: str,
+    headers: Mapping[str, str],
+    started_at: float,
+    status_code: int | None,
+    error_code: str | None,
+    error_message: str | None,
+) -> None:
+    settings = get_settings()
+    if not settings.log_upstream_request_summary:
+        return
+
+    level = logging.INFO
+    if status_code is not None and status_code >= 500:
+        level = logging.ERROR
+    elif (status_code is not None and status_code >= 400) or error_code is not None:
+        level = logging.WARNING
+
+    logger.log(
+        level,
+        (
+            "upstream_request_complete request_id=%s kind=%s method=POST target=%s "
+            "account_id=%s status=%s duration_ms=%s error_code=%s error_message=%s"
+        ),
+        get_request_id(),
+        kind,
+        _summarize_upstream_target(url),
+        headers.get("chatgpt-account-id"),
+        status_code,
+        int((time.monotonic() - started_at) * 1000),
+        error_code,
+        error_message,
+    )
+
+
 def _normalize_error_code(code: str | None, error_type: str | None) -> str:
     if code:
         normalized_code = code.lower()
@@ -146,6 +342,54 @@ def _normalize_error_code(code: str | None, error_type: str | None) -> str:
         mapped = _ERROR_TYPE_CODE_MAP.get(normalized_type)
         return mapped or normalized_type
     return "upstream_error"
+
+
+def _effective_stream_timeout(configured_timeout_seconds: float, timeout_kind: str) -> float:
+    if timeout_kind == "connect":
+        override = _STREAM_CONNECT_TIMEOUT_OVERRIDE.get()
+    elif timeout_kind == "idle":
+        override = _STREAM_IDLE_TIMEOUT_OVERRIDE.get()
+    else:
+        override = _STREAM_TOTAL_TIMEOUT_OVERRIDE.get()
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
+
+
+def _effective_compact_connect_timeout(configured_timeout_seconds: float) -> float:
+    override = _COMPACT_CONNECT_TIMEOUT_OVERRIDE.get()
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
+
+
+def _effective_compact_total_timeout(configured_timeout_seconds: float | None) -> float | None:
+    override = _COMPACT_TOTAL_TIMEOUT_OVERRIDE.get()
+    if configured_timeout_seconds is None:
+        return None if override is None else max(0.001, override)
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
+
+
+def _effective_transcribe_connect_timeout(configured_timeout_seconds: float) -> float:
+    override = _TRANSCRIBE_CONNECT_TIMEOUT_OVERRIDE.get()
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
+
+
+def _effective_transcribe_total_timeout(configured_timeout_seconds: float) -> float:
+    override = _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE.get()
+    if override is None:
+        return configured_timeout_seconds
+    return max(0.001, min(configured_timeout_seconds, override))
+
+
+def _remaining_total_timeout(timeout_seconds: float | None, started_at: float, now: float) -> float | None:
+    if timeout_seconds is None:
+        return None
+    return max(0.001, timeout_seconds - max(0.0, now - started_at))
 
 
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
@@ -173,17 +417,35 @@ async def _iter_sse_events(
     idle_timeout_seconds: float,
     max_event_bytes: int,
 ) -> AsyncIterator[str]:
+    async def _next_chunk() -> bytes:
+        return await iterator.__anext__()
+
+    async def _cancel_pending_chunk(task: asyncio.Task[bytes]) -> None:
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     buffer = bytearray()
     chunk_iterator = resp.content.iter_chunked(_SSE_READ_CHUNK_SIZE)
     iterator = chunk_iterator.__aiter__()
 
     while True:
+        next_chunk = asyncio.create_task(_next_chunk())
         try:
-            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_timeout_seconds)
+            done, _ = await asyncio.wait({next_chunk}, timeout=idle_timeout_seconds)
+            if not done:
+                await _cancel_pending_chunk(next_chunk)
+                raise StreamIdleTimeoutError()
+            chunk = await next_chunk
         except StopAsyncIteration:
             break
-        except asyncio.TimeoutError as exc:
-            raise StreamIdleTimeoutError() from exc
+        except asyncio.CancelledError:
+            await _cancel_pending_chunk(next_chunk)
+            raise
 
         if not chunk:
             continue
@@ -603,21 +865,46 @@ async def stream_responses(
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/codex/responses"
     upstream_headers = _build_upstream_headers(headers, access_token, account_id)
-    timeout = aiohttp.ClientTimeout(
-        total=None,
-        sock_connect=settings.upstream_connect_timeout_seconds,
-        sock_read=None,
+    pre_request_started_at = time.monotonic()
+    effective_total_timeout = _effective_stream_timeout(
+        getattr(settings, "proxy_request_budget_seconds", 75.0),
+        "total",
     )
+    effective_connect_timeout = _effective_stream_timeout(settings.upstream_connect_timeout_seconds, "connect")
+    effective_idle_timeout = _effective_stream_timeout(settings.stream_idle_timeout_seconds, "idle")
 
     seen_terminal = False
+    status_code: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
     client_session = session or get_http_client().session
     payload_dict = payload.to_payload()
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
             payload_dict,
             _as_image_fetch_session(client_session),
-            settings.upstream_connect_timeout_seconds,
+            effective_connect_timeout,
         )
+    effective_total_timeout = _remaining_total_timeout(
+        effective_total_timeout,
+        pre_request_started_at,
+        time.monotonic(),
+    )
+    timeout = aiohttp.ClientTimeout(
+        total=effective_total_timeout,
+        sock_connect=effective_connect_timeout,
+        sock_read=None,
+    )
+    started_at = time.monotonic()
+    _maybe_log_upstream_request_start(
+        kind="responses",
+        url=url,
+        headers=upstream_headers,
+        payload_summary=_summarize_json_payload(payload_dict),
+        payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
+        if settings.log_upstream_request_payload
+        else None,
+    )
     try:
         async with client_session.post(
             url,
@@ -625,17 +912,20 @@ async def stream_responses(
             headers=upstream_headers,
             timeout=timeout,
         ) as resp:
+            status_code = resp.status
             if resp.status >= 400:
                 if raise_for_status:
                     error_payload = await _error_payload_from_response(resp)
+                    error_code, error_message = _error_details_from_envelope(error_payload)
                     raise ProxyResponseError(resp.status, error_payload)
                 event = await _error_event_from_response(resp)
+                error_code, error_message = _error_details_from_failed_event(event)
                 yield format_sse_event(event)
                 return
 
             async for event_block in _iter_sse_events(
                 resp,
-                settings.stream_idle_timeout_seconds,
+                effective_idle_timeout,
                 settings.max_sse_event_bytes,
             ):
                 event_block = _normalize_sse_event_block(event_block)
@@ -648,6 +938,8 @@ async def stream_responses(
     except ProxyResponseError:
         raise
     except StreamIdleTimeoutError:
+        error_code = "stream_idle_timeout"
+        error_message = "Upstream stream idle timeout"
         yield format_sse_event(
             response_failed_event(
                 "stream_idle_timeout",
@@ -657,6 +949,8 @@ async def stream_responses(
         )
         return
     except StreamEventTooLargeError as exc:
+        error_code = "stream_event_too_large"
+        error_message = str(exc)
         yield format_sse_event(
             response_failed_event(
                 "stream_event_too_large",
@@ -666,24 +960,148 @@ async def stream_responses(
         )
         return
     except aiohttp.ClientError as exc:
+        error_code = "upstream_unavailable"
+        error_message = str(exc)
         yield format_sse_event(
             response_failed_event("upstream_unavailable", str(exc), response_id=get_request_id()),
         )
         return
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        yield format_sse_event(response_failed_event("upstream_error", str(exc), response_id=get_request_id()))
-        return
-
-    if not seen_terminal:
+    except asyncio.TimeoutError as exc:
+        if isinstance(exc, aiohttp.ClientError):
+            error_code = "upstream_unavailable"
+            error_message = str(exc) or "Request to upstream timed out"
+            yield format_sse_event(
+                response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            )
+            return
+        error_code = "upstream_request_timeout"
+        error_message = "Proxy request budget exhausted"
         yield format_sse_event(
             response_failed_event(
-                "stream_incomplete",
-                "Upstream closed stream without completion",
+                "upstream_request_timeout",
+                "Proxy request budget exhausted",
                 response_id=get_request_id(),
             ),
         )
+        return
+    except Exception as exc:
+        error_code = "upstream_error"
+        error_message = str(exc)
+        yield format_sse_event(response_failed_event("upstream_error", str(exc), response_id=get_request_id()))
+        return
+    else:
+        if not seen_terminal:
+            error_code = "stream_incomplete"
+            error_message = "Upstream closed stream without completion"
+            yield format_sse_event(
+                response_failed_event(
+                    "stream_incomplete",
+                    "Upstream closed stream without completion",
+                    response_id=get_request_id(),
+                ),
+            )
+    finally:
+        _maybe_log_upstream_request_complete(
+            kind="responses",
+            url=url,
+            headers=upstream_headers,
+            started_at=started_at,
+            status_code=status_code,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+
+def push_stream_timeout_overrides(
+    *,
+    connect_timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    total_timeout_seconds: float | None = None,
+) -> tuple[
+    float | None,
+    float | None,
+    float | None,
+]:
+    previous = (
+        _STREAM_CONNECT_TIMEOUT_OVERRIDE.get(),
+        _STREAM_IDLE_TIMEOUT_OVERRIDE.get(),
+        _STREAM_TOTAL_TIMEOUT_OVERRIDE.get(),
+    )
+    _STREAM_CONNECT_TIMEOUT_OVERRIDE.set(connect_timeout_seconds)
+    _STREAM_IDLE_TIMEOUT_OVERRIDE.set(idle_timeout_seconds)
+    _STREAM_TOTAL_TIMEOUT_OVERRIDE.set(total_timeout_seconds)
+    return previous
+
+
+def pop_stream_timeout_overrides(
+    tokens: tuple[
+        float | None,
+        float | None,
+        float | None,
+    ],
+) -> None:
+    connect_timeout, idle_timeout, total_timeout = tokens
+    _STREAM_CONNECT_TIMEOUT_OVERRIDE.set(connect_timeout)
+    _STREAM_IDLE_TIMEOUT_OVERRIDE.set(idle_timeout)
+    _STREAM_TOTAL_TIMEOUT_OVERRIDE.set(total_timeout)
+
+
+@contextlib.contextmanager
+def override_stream_timeouts(
+    *,
+    connect_timeout_seconds: float | None = None,
+    idle_timeout_seconds: float | None = None,
+    total_timeout_seconds: float | None = None,
+):
+    tokens = push_stream_timeout_overrides(
+        connect_timeout_seconds=connect_timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        total_timeout_seconds=total_timeout_seconds,
+    )
+    try:
+        yield
+    finally:
+        pop_stream_timeout_overrides(tokens)
+
+
+def push_compact_timeout_overrides(
+    *,
+    connect_timeout_seconds: float | None = None,
+    total_timeout_seconds: float | None = None,
+) -> tuple[contextvars.Token[float | None], contextvars.Token[float | None]]:
+    return (
+        _COMPACT_CONNECT_TIMEOUT_OVERRIDE.set(connect_timeout_seconds),
+        _COMPACT_TOTAL_TIMEOUT_OVERRIDE.set(total_timeout_seconds),
+    )
+
+
+def pop_compact_timeout_overrides(
+    tokens: tuple[contextvars.Token[float | None], contextvars.Token[float | None]],
+) -> None:
+    connect_token, total_token = tokens
+    _COMPACT_CONNECT_TIMEOUT_OVERRIDE.reset(connect_token)
+    _COMPACT_TOTAL_TIMEOUT_OVERRIDE.reset(total_token)
+
+
+def push_transcribe_timeout_overrides(
+    *,
+    connect_timeout_seconds: float | None = None,
+    total_timeout_seconds: float | None = None,
+) -> tuple[contextvars.Token[float | None], contextvars.Token[float | None]]:
+    return (
+        _TRANSCRIBE_CONNECT_TIMEOUT_OVERRIDE.set(connect_timeout_seconds),
+        _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE.set(total_timeout_seconds),
+    )
+
+
+def pop_transcribe_timeout_overrides(
+    tokens: tuple[contextvars.Token[float | None], contextvars.Token[float | None]],
+) -> None:
+    connect_token, total_token = tokens
+    _TRANSCRIBE_CONNECT_TIMEOUT_OVERRIDE.reset(connect_token)
+    _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE.reset(total_token)
 
 
 async def compact_responses(
@@ -702,11 +1120,9 @@ async def compact_responses(
         account_id,
         accept="application/json",
     )
-    timeout = aiohttp.ClientTimeout(
-        total=60,
-        sock_connect=settings.upstream_connect_timeout_seconds,
-        sock_read=60,
-    )
+    pre_request_started_at = time.monotonic()
+    compact_timeout_seconds = _effective_compact_total_timeout(settings.upstream_compact_timeout_seconds)
+    effective_connect_timeout = _effective_compact_connect_timeout(settings.upstream_connect_timeout_seconds)
 
     client_session = session or get_http_client().session
     payload_dict = payload.to_payload()
@@ -714,8 +1130,36 @@ async def compact_responses(
         payload_dict = await _inline_input_image_urls(
             payload_dict,
             _as_image_fetch_session(client_session),
-            settings.upstream_connect_timeout_seconds,
+            effective_connect_timeout,
         )
+    now = time.monotonic()
+    compact_timeout_seconds = _remaining_total_timeout(
+        compact_timeout_seconds,
+        pre_request_started_at,
+        now,
+    )
+    effective_connect_timeout = max(
+        0.001,
+        _remaining_total_timeout(effective_connect_timeout, pre_request_started_at, now) or effective_connect_timeout,
+    )
+    timeout = aiohttp.ClientTimeout(
+        total=compact_timeout_seconds,
+        sock_connect=effective_connect_timeout,
+        sock_read=compact_timeout_seconds,
+    )
+    started_at = time.monotonic()
+    status_code: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    _maybe_log_upstream_request_start(
+        kind="responses_compact",
+        url=url,
+        headers=upstream_headers,
+        payload_summary=_summarize_json_payload(payload_dict),
+        payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
+        if settings.log_upstream_request_payload
+        else None,
+    )
     try:
         async with client_session.post(
             url,
@@ -723,11 +1167,20 @@ async def compact_responses(
             headers=upstream_headers,
             timeout=timeout,
         ) as resp:
+            status_code = resp.status
             if resp.status >= 400:
                 error_payload = await _error_payload_from_response(resp)
+                error_code, error_message = _error_details_from_envelope(error_payload)
                 raise ProxyResponseError(resp.status, error_payload)
             try:
                 data = await resp.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                error_code = "upstream_unavailable"
+                error_message = str(exc)
+                raise ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", str(exc)),
+                ) from exc
             except Exception as exc:
                 raise ProxyResponseError(
                     502,
@@ -740,13 +1193,27 @@ async def compact_responses(
                 502,
                 openai_error("upstream_error", "Unexpected upstream payload"),
             )
-    except ProxyResponseError:
+    except ProxyResponseError as exc:
+        if error_code is None and error_message is None:
+            error_code, error_message = _error_details_from_envelope(exc.payload)
         raise
     except aiohttp.ClientError as exc:
+        error_code = "upstream_unavailable"
+        error_message = str(exc)
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", str(exc)),
         ) from exc
+    finally:
+        _maybe_log_upstream_request_complete(
+            kind="responses_compact",
+            url=url,
+            headers=upstream_headers,
+            started_at=started_at,
+            status_code=status_code,
+            error_code=error_code,
+            error_message=error_message,
+        )
 
 
 async def transcribe_audio(
@@ -774,10 +1241,14 @@ async def transcribe_audio(
         if header_name.lower() == "content-type":
             upstream_headers.pop(header_name, None)
 
+    effective_total_timeout = _effective_transcribe_total_timeout(
+        getattr(settings, "transcription_request_budget_seconds", 120.0),
+    )
+    effective_connect_timeout = _effective_transcribe_connect_timeout(settings.upstream_connect_timeout_seconds)
     timeout = aiohttp.ClientTimeout(
-        total=120,
-        sock_connect=settings.upstream_connect_timeout_seconds,
-        sock_read=120,
+        total=effective_total_timeout,
+        sock_connect=effective_connect_timeout,
+        sock_read=effective_total_timeout,
     )
 
     normalized_filename = filename.strip() if filename else ""
@@ -798,6 +1269,25 @@ async def transcribe_audio(
         form.add_field("prompt", prompt)
 
     client_session = session or get_http_client().session
+    started_at = time.monotonic()
+    status_code: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    metadata = _summarize_transcription_payload(
+        filename=normalized_filename,
+        content_type=normalized_content_type,
+        prompt=prompt,
+        audio_bytes=audio_bytes,
+    )
+    _maybe_log_upstream_request_start(
+        kind="transcribe",
+        url=url,
+        headers=upstream_headers,
+        payload_summary=json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        payload_json=json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
+        if settings.log_upstream_request_payload
+        else None,
+    )
     try:
         async with client_session.post(
             url,
@@ -805,18 +1295,24 @@ async def transcribe_audio(
             headers=upstream_headers,
             timeout=timeout,
         ) as resp:
+            status_code = resp.status
             if resp.status >= 400:
                 error_payload = await _error_payload_from_response(resp)
+                error_code, error_message = _error_details_from_envelope(error_payload)
                 raise ProxyResponseError(resp.status, error_payload)
             try:
                 data = await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 message = str(exc) or "Request to upstream timed out"
+                error_code = "upstream_unavailable"
+                error_message = message
                 raise ProxyResponseError(
                     502,
                     openai_error("upstream_unavailable", message),
                 ) from exc
             except Exception as exc:
+                error_code = "upstream_error"
+                error_message = "Invalid JSON from upstream"
                 raise ProxyResponseError(
                     502,
                     openai_error("upstream_error", "Invalid JSON from upstream"),
@@ -827,11 +1323,25 @@ async def transcribe_audio(
                 502,
                 openai_error("upstream_error", "Unexpected upstream payload"),
             )
-    except ProxyResponseError:
+    except ProxyResponseError as exc:
+        if error_code is None and error_message is None:
+            error_code, error_message = _error_details_from_envelope(exc.payload)
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         message = str(exc) or "Request to upstream timed out"
+        error_code = "upstream_unavailable"
+        error_message = message
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", message),
         ) from exc
+    finally:
+        _maybe_log_upstream_request_complete(
+            kind="transcribe",
+            url=url,
+            headers=upstream_headers,
+            started_at=started_at,
+            status_code=status_code,
+            error_code=error_code,
+            error_message=error_message,
+        )

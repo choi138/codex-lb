@@ -23,21 +23,24 @@ describe("RecentRequestsTable", () => {
     render(
       <RecentRequestsTable
         {...PAGINATION_PROPS}
-        accounts={[
-          {
-            accountId: "acc-primary",
-            email: "primary@example.com",
-            displayName: "Primary Account",
-            planType: "plus",
-            status: "active",
-          },
-        ]}
+         accounts={[
+           {
+             accountId: "acc-primary",
+             email: "primary@example.com",
+             displayName: "Primary Account",
+             planType: "plus",
+             status: "active",
+             additionalQuotas: [],
+           },
+         ]}
         requests={[
           {
             requestedAt: ISO,
             accountId: "acc-primary",
+            apiKeyName: "Key Alpha",
             requestId: "req-1",
             model: "gpt-5.1",
+            serviceTier: "priority",
             status: "rate_limit",
             errorCode: "rate_limit_exceeded",
             errorMessage: longError,
@@ -52,7 +55,8 @@ describe("RecentRequestsTable", () => {
     );
 
     expect(screen.getByText("Primary Account")).toBeInTheDocument();
-    expect(screen.getByText("gpt-5.1 (high)")).toBeInTheDocument();
+    expect(screen.getByText("Key Alpha")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.1 (high, priority)")).toBeInTheDocument();
     expect(screen.getByText("Rate limit")).toBeInTheDocument();
 
     const viewButton = screen.getByRole("button", { name: "View" });

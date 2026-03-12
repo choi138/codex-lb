@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 import pytest
 
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.proxy import ProxyResponseError
+from app.core.errors import openai_error
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
-from app.modules.usage.repository import UsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.integration
 
@@ -48,6 +49,48 @@ async def test_proxy_compact_no_accounts(async_client):
     assert response.status_code == 503
     error = response.json()["error"]
     assert error["code"] == "no_accounts"
+
+
+@pytest.mark.asyncio
+async def test_proxy_compact_surfaces_no_additional_quota_eligible_accounts(async_client):
+    email = "compact-gated@example.com"
+    raw_account_id = "acc_compact_gated"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    expected_account_id = generate_unique_account_id(raw_account_id, email)
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    async with SessionLocal() as session:
+        usage_repo = UsageRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await usage_repo.add_entry(
+            account_id=expected_account_id,
+            used_percent=25.0,
+            window="primary",
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+            recorded_at=now,
+        )
+        await additional_repo.add_entry(
+            account_id=expected_account_id,
+            limit_name="codex_other",
+            metered_feature="codex_bengalfox",
+            window="primary",
+            used_percent=100.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+            recorded_at=now,
+        )
+
+    payload = {"model": "gpt-5.3-codex-spark", "instructions": "hi", "input": []}
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    assert response.status_code == 503
+    error = response.json()["error"]
+    assert error["code"] == "no_additional_quota_eligible_accounts"
 
 
 @pytest.mark.asyncio
@@ -179,3 +222,38 @@ async def test_proxy_compact_usage_limit_marks_account(async_client, monkeypatch
         account = await session.get(Account, expected_account_id)
         assert account is not None
         assert account.status == AccountStatus.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_proxy_compact_retry_uses_refreshed_account_id(async_client, monkeypatch):
+    email = "compact-retry@example.com"
+    raw_account_id = "acc_compact_retry_old"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    captured_account_ids: list[str | None] = []
+
+    async def fake_compact(payload, headers, access_token, account_id):
+        captured_account_ids.append(account_id)
+        if len(captured_account_ids) == 1:
+            raise ProxyResponseError(
+                401,
+                openai_error("invalid_api_key", "token expired"),
+            )
+        return OpenAIResponsePayload.model_validate({"output": []})
+
+    async def fake_ensure_fresh(self, account, force: bool = False):
+        if force:
+            account.chatgpt_account_id = "acc_compact_retry_new"
+        return account
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh", fake_ensure_fresh)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    assert response.status_code == 200
+    assert response.json()["output"] == []
+    assert captured_account_ids == ["acc_compact_retry_old", "acc_compact_retry_new"]

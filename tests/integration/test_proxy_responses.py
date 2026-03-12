@@ -66,6 +66,25 @@ async def test_proxy_responses_no_accounts(async_client):
 
 
 @pytest.mark.asyncio
+async def test_proxy_responses_stream_surfaces_additional_quota_data_unavailable(async_client):
+    email = "gated-unavailable@example.com"
+    raw_account_id = "acc_gated_unavailable"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    payload = {"model": "gpt-5.3-codex-spark", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    event = _extract_first_event(lines)
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "additional_quota_data_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_requires_instructions(async_client):
     payload = {"model": "gpt-5.1", "input": []}
     resp = await async_client.post("/backend-api/codex/responses", json=payload)
@@ -552,6 +571,44 @@ async def test_v1_responses_non_streaming_returns_response(async_client, monkeyp
     assert body["object"] == "response"
     assert body["status"] == "completed"
     assert observed_stream["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_non_streaming_reconstructs_reasoning_output(async_client, monkeypatch):
+    email = "responses-reasoning-output@example.com"
+    raw_account_id = "acc_responses_reasoning_output"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        yield (
+            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1",'
+            '"type":"reasoning","summary":[{"type":"summary_text","text":"Need more steps"}],'
+            '"reasoning_details":{"tokens":4}}}\n\n'
+        )
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_reasoning_1","object":"response",'
+            '"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "input": [{"role": "user", "content": "hi"}], "stream": False}
+    resp = await async_client.post("/v1/responses", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "resp_reasoning_1"
+    assert body["output"] == [
+        {
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Need more steps"}],
+            "reasoning_details": {"tokens": 4},
+        }
+    ]
 
 
 @pytest.mark.asyncio

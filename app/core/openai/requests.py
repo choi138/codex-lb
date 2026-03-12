@@ -294,6 +294,7 @@ class ResponsesRequest(BaseModel):
     store: bool = False
     stream: bool | None = None
     include: list[str] = Field(default_factory=list)
+    service_tier: str | None = None
     conversation: str | None = None
     previous_response_id: str | None = None
     truncation: str | None = None
@@ -370,6 +371,7 @@ class ResponsesCompactRequest(BaseModel):
     model: str = Field(min_length=1)
     instructions: str
     input: JsonValue
+    reasoning: ResponsesReasoning | None = None
 
     @field_validator("input")
     @classmethod
@@ -418,6 +420,13 @@ def _normalize_openai_compatible_aliases(payload: dict[str, JsonValue]) -> None:
     reasoning_summary = payload.pop("reasoningSummary", None)
     text_verbosity = payload.pop("textVerbosity", None)
     top_level_verbosity = payload.pop("verbosity", None)
+    prompt_cache_key = payload.pop("promptCacheKey", None)
+    prompt_cache_retention = payload.pop("promptCacheRetention", None)
+
+    if isinstance(prompt_cache_key, str) and "prompt_cache_key" not in payload:
+        payload["prompt_cache_key"] = prompt_cache_key
+    if isinstance(prompt_cache_retention, str) and "prompt_cache_retention" not in payload:
+        payload["prompt_cache_retention"] = prompt_cache_retention
 
     reasoning_payload = payload.get("reasoning")
     if is_json_mapping(reasoning_payload):
