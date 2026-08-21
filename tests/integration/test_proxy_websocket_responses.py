@@ -6008,9 +6008,8 @@ def test_responses_websocket_replays_client_full_resend_previous_response_miss_w
                             "status": 400,
                             "error": {
                                 "type": "invalid_request_error",
-                                "code": "previous_response_not_found",
-                                "message": "Previous response with id 'resp_ws_prev_anchor' not found.",
-                                "param": "previous_response_id",
+                                "code": "invalid_request_error",
+                                "message": "Invalid `previous_response_id`.",
                             },
                         },
                         separators=(",", ":"),
